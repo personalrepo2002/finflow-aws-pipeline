@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  FinFlow - Financial Transactions Data Pipeline
+  Provisions: S3 buckets, Glue Database/Jobs/Crawlers, IAM Roles, Step Functions.
+  Author: [Your Name] | AWS Data Engineering Portfolio
+
+# ─── Parameters ───────────────────────────────────────────────────────────────
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: finflow
+    Description: Project prefix for all resource names
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  AlertEmail:
+    Type: String
+    Description: Email address for pipeline failure alerts
+    Default: your-email@example.com
+
+  GlueWorkerType:
+    Type: String
+    Default: G.1X
+    AllowedValues: [G.025X, G.1X, G.2X]
+    Description: Glue worker type (G.1X recommended for dev)
+
+  GlueNumberOfWorkers:
+    Type: Number
+    Default: 5
+    Description: Number of Glue workers
+
+# ─── Resources ────────────────────────────────────────────────────────────────
+
+Resources:
+
+  # ── S3 Buckets ──────────────────────────────────────────────────────────────
+
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-data-lake-${AWS::AccountId}-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: archive-raw-after-90-days
+            Status: Enabled
+            Prefix: raw/
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: delete-quarantine-after-30-days
+            Status: Enabled
+            Prefix: quarantine/
+            ExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  GlueTempBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-glue-temp-${AWS::AccountId}-${Environment}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: delete-temp-after-7-days
+            Status: Enabled
+            ExpirationInDays: 7
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-athena-results-${AWS::AccountId}-${Environment}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: delete-results-after-30-days
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ── IAM Roles ────────────────────────────────────────────────────────────────
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-glue-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: FinFlowGlueS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub "${DataLakeBucket.Arn}/*"
+                  - !GetAtt GlueTempBucket.Arn
+                  - !Sub "${GlueTempBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:UpdateTable
+                  - glue:CreateTable
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*"
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-stepfn-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FinFlowStepFnPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PipelineAlertsTopic
+
+  # ── Glue Resources ───────────────────────────────────────────────────────────
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${ProjectName}_db"
+        Description: "FinFlow financial transactions data catalog"
+
+  GlueJob1RawToProcessed:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-01-raw-to-processed"
+      Description: "Cleanse raw CSV transactions → Parquet processed layer"
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: "4.0"
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref GlueNumberOfWorkers
+      Timeout: 60
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DataLakeBucket}/scripts/01_raw_to_processed.py"
+      DefaultArguments:
+        "--enable-metrics": "true"
+        "--enable-spark-ui": "true"
+        "--spark-event-logs-path": !Sub "s3://${GlueTempBucket}/spark-logs/"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--SOURCE_BUCKET": !Ref DataLakeBucket
+        "--DEST_BUCKET": !Ref DataLakeBucket
+        "--SOURCE_PREFIX": "raw/transactions"
+        "--DEST_PREFIX": "processed/transactions"
+        "--GLUE_DATABASE": !Sub "${ProjectName}_db"
+        "--GLUE_TABLE": "processed_transactions"
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+  GlueJob2FraudDetection:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-02-fraud-detection"
+      Description: "Fraud scoring with PySpark Window Functions"
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: "4.0"
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref GlueNumberOfWorkers
+      Timeout: 90
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DataLakeBucket}/scripts/02_fraud_detection.py"
+      DefaultArguments:
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--SOURCE_BUCKET": !Ref DataLakeBucket
+        "--DEST_BUCKET": !Ref DataLakeBucket
+        "--SOURCE_PREFIX": "processed/transactions"
+        "--DEST_PREFIX": "curated/transactions"
+
+  GlueJob3LoadRedshift:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-03-load-to-redshift"
+      Description: "Load curated data to Amazon Redshift"
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: "4.0"
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref GlueNumberOfWorkers
+      Timeout: 60
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DataLakeBucket}/scripts/03_load_to_redshift.py"
+      DefaultArguments:
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--SOURCE_BUCKET": !Ref DataLakeBucket
+        "--SOURCE_PREFIX": "curated/transactions"
+        "--REDSHIFT_TMP_DIR": !Sub "s3://${GlueTempBucket}/redshift-tmp/"
+
+  # ── SNS Alerts ───────────────────────────────────────────────────────────────
+
+  PipelineAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-pipeline-alerts-${Environment}"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ── Step Functions State Machine ──────────────────────────────────────────────
+
+  PipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-pipeline-${Environment}"
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionS3Location:
+        Bucket: !Ref DataLakeBucket
+        Key: "step_functions/pipeline_definition.json"
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt PipelineLogGroup.Arn
+
+  PipelineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/states/${ProjectName}-pipeline-${Environment}"
+      RetentionInDays: 30
+
+# ─── Outputs ──────────────────────────────────────────────────────────────────
+
+Outputs:
+  DataLakeBucketName:
+    Description: "S3 Data Lake bucket name"
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub "${ProjectName}-data-lake-bucket"
+
+  GlueDatabaseName:
+    Description: "Glue Data Catalog database name"
+    Value: !Sub "${ProjectName}_db"
+
+  StateMachineArn:
+    Description: "Step Functions state machine ARN"
+    Value: !Ref PipelineStateMachine
+    Export:
+      Name: !Sub "${ProjectName}-state-machine-arn"
+
+  GlueRoleArn:
+    Description: "IAM Role ARN for Glue jobs"
+    Value: !GetAtt GlueServiceRole.Arn

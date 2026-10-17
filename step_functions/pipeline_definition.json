@@ -1,0 +1,192 @@
+{
+  "Comment": "FinFlow Financial Transactions Pipeline — AWS Step Functions State Machine\nOrchestrates: Raw → Processed → Fraud Scored → Redshift Load\nWith error handling, retry logic, and SNS notifications.",
+  "StartAt": "StartPipelineNotification",
+  "States": {
+
+    "StartPipelineNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:ACCOUNT_ID:finflow-pipeline-alerts",
+        "Message.$": "States.Format('FinFlow Pipeline STARTED at {}', $$.Execution.StartTime)",
+        "Subject": "FinFlow Pipeline Started"
+      },
+      "Next": "StartGlueJob1RawToProcessed",
+      "ResultPath": null
+    },
+
+    "StartGlueJob1RawToProcessed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "finflow-01-raw-to-processed",
+        "Arguments": {
+          "--SOURCE_BUCKET": "finflow-data-lake",
+          "--DEST_BUCKET": "finflow-data-lake",
+          "--SOURCE_PREFIX": "raw/transactions",
+          "--DEST_PREFIX": "processed/transactions",
+          "--GLUE_DATABASE": "finflow_db",
+          "--GLUE_TABLE": "processed_transactions"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Glue.AWSGlueException", "States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0,
+          "Comment": "Retry Glue job with exponential backoff"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PipelineFailureHandler",
+          "ResultPath": "$.error_info"
+        }
+      ],
+      "Next": "CheckJob1Status",
+      "Comment": "Run ETL Job 1: Cleanse raw CSV → Parquet"
+    },
+
+    "CheckJob1Status": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.JobRunState",
+          "StringEquals": "SUCCEEDED",
+          "Next": "StartGlueJob2FraudDetection"
+        }
+      ],
+      "Default": "PipelineFailureHandler"
+    },
+
+    "StartGlueJob2FraudDetection": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "finflow-02-fraud-detection",
+        "Arguments": {
+          "--SOURCE_BUCKET": "finflow-data-lake",
+          "--DEST_BUCKET": "finflow-data-lake",
+          "--SOURCE_PREFIX": "processed/transactions",
+          "--DEST_PREFIX": "curated/transactions"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Glue.AWSGlueException", "States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PipelineFailureHandler",
+          "ResultPath": "$.error_info"
+        }
+      ],
+      "Next": "ParallelPostProcessing",
+      "Comment": "Run ETL Job 2: Fraud scoring with PySpark Window Functions"
+    },
+
+    "ParallelPostProcessing": {
+      "Type": "Parallel",
+      "Comment": "Run Redshift load AND Athena partition repair in parallel",
+      "Branches": [
+        {
+          "StartAt": "StartGlueJob3LoadRedshift",
+          "States": {
+            "StartGlueJob3LoadRedshift": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "finflow-03-load-to-redshift",
+                "Arguments": {
+                  "--SOURCE_BUCKET": "finflow-data-lake",
+                  "--SOURCE_PREFIX": "curated/transactions",
+                  "--REDSHIFT_CONNECTION": "finflow-redshift-conn",
+                  "--REDSHIFT_DB": "finflow",
+                  "--REDSHIFT_SCHEMA": "finflow",
+                  "--REDSHIFT_TMP_DIR": "s3://finflow-glue-temp/redshift-tmp/",
+                  "--LOAD_MODE": "incremental"
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["Glue.AWSGlueException"],
+                  "IntervalSeconds": 60,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "RepairAthenaPartitions",
+          "States": {
+            "RepairAthenaPartitions": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+              "Parameters": {
+                "QueryString": "MSCK REPAIR TABLE finflow_db.curated_transactions",
+                "WorkGroup": "finflow-workgroup",
+                "ResultConfiguration": {
+                  "OutputLocation": "s3://finflow-athena-results/step-functions/"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "PipelineSuccessNotification",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PipelineFailureHandler",
+          "ResultPath": "$.error_info"
+        }
+      ]
+    },
+
+    "PipelineSuccessNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:ACCOUNT_ID:finflow-pipeline-alerts",
+        "Message.$": "States.Format('FinFlow Pipeline SUCCEEDED at {}. All 3 Glue jobs completed.', $$.Execution.StartTime)",
+        "Subject": "✅ FinFlow Pipeline Succeeded"
+      },
+      "Next": "PipelineComplete",
+      "ResultPath": null
+    },
+
+    "PipelineFailureHandler": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:ACCOUNT_ID:finflow-pipeline-alerts",
+        "Message.$": "States.Format('FinFlow Pipeline FAILED. Error: {}', $.error_info)",
+        "Subject": "❌ FinFlow Pipeline Failed"
+      },
+      "Next": "PipelineFailed",
+      "ResultPath": null
+    },
+
+    "PipelineComplete": {
+      "Type": "Succeed",
+      "Comment": "Pipeline completed successfully"
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineError",
+      "Cause": "One or more Glue jobs failed. Check CloudWatch Logs."
+    }
+  }
+}

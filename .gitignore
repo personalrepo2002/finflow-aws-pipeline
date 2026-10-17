@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.env
+venv/
+.venv/
+
+# Data files (don't commit generated data)
+data_generator/output/
+*.csv
+*.parquet
+/tmp/
+
+# AWS credentials (never commit these!)
+.aws/
+*.pem
+*.key
+credentials
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
